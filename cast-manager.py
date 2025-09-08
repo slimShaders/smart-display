@@ -1,0 +1,374 @@
+#!/usr/bin/env python3
+"""
+Smart Display Cast Manager
+Automatically discovers Nest Hub and manages casting from Raspberry Pi
+"""
+
+import subprocess
+import time
+import logging
+import json
+import socket
+import threading
+from datetime import datetime, timedelta
+import signal
+import sys
+import os
+import urllib.request
+import urllib.error
+
+class CastManager:
+    def __init__(self):
+        self.nest_hub_ip = None
+        self.nest_hub_hostname = "nest-hub"
+        self.server_port = 5500
+        self.server_container_name = "smart-display-server"
+        self.last_cast_time = None
+        self.network_scan_interval = 60  # 1 minute
+        self.running = True
+        
+        # Setup logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler('/var/log/cast-manager.log'),
+                logging.StreamHandler(sys.stdout)
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+        
+        # Handle graceful shutdown
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+
+    def signal_handler(self, signum, frame):
+        """Handle shutdown signals gracefully"""
+        self.logger.info(f"Received signal {signum}, shutting down...")
+        self.running = False
+
+    def get_local_ip(self):
+        """Get the local IP address of this device"""
+        try:
+            # Connect to a remote address to determine local IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect(("8.8.8.8", 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip
+        except Exception as e:
+            self.logger.error(f"Failed to get local IP: {e}")
+            return None
+
+    def get_network_range(self):
+        """Get the network range for scanning"""
+        local_ip = self.get_local_ip()
+        if not local_ip:
+            return None
+        
+        # Assume /24 network
+        ip_parts = local_ip.split('.')
+        network_base = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}"
+        return network_base
+
+    def scan_for_nest_hub(self):
+        """Scan network for device with hostname 'nest-hub'"""
+        self.logger.info("Scanning network for Nest Hub...")
+        
+        network_base = self.get_network_range()
+        if not network_base:
+            self.logger.error("Could not determine network range")
+            return None
+
+        # Use nmap to scan for devices (install with: sudo apt install nmap)
+        try:
+            cmd = f"nmap -sn {network_base}.1-254"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode != 0:
+                self.logger.warning("nmap not available, trying alternative scan...")
+                return self.scan_for_nest_hub_alternative()
+            
+            # Parse nmap output for active IPs
+            active_ips = []
+            for line in result.stdout.split('\n'):
+                if 'Nmap scan report for' in line:
+                    ip = line.split()[-1].strip('()')
+                    active_ips.append(ip)
+            
+            # Check each IP for hostname
+            for ip in active_ips:
+                if self.check_hostname(ip):
+                    self.logger.info(f"Found Nest Hub at {ip}")
+                    return ip
+                    
+        except subprocess.TimeoutExpired:
+            self.logger.warning("Network scan timed out")
+        except Exception as e:
+            self.logger.error(f"Network scan failed: {e}")
+        
+        return None
+
+    def scan_for_nest_hub_alternative(self):
+        """Alternative scan method using ping"""
+        self.logger.info("Using ping-based network scan...")
+        network_base = self.get_network_range()
+        if not network_base:
+            return None
+
+        active_ips = []
+        
+        # Ping common IP ranges
+        for i in range(1, 255):
+            ip = f"{network_base}.{i}"
+            try:
+                result = subprocess.run(
+                    f"ping -c 1 -W 1 {ip}", 
+                    shell=True, 
+                    capture_output=True, 
+                    timeout=2
+                )
+                if result.returncode == 0:
+                    active_ips.append(ip)
+            except:
+                continue
+        
+        # Check hostnames
+        for ip in active_ips:
+            if self.check_hostname(ip):
+                self.logger.info(f"Found Nest Hub at {ip}")
+                return ip
+        
+        return None
+
+    def check_hostname(self, ip):
+        """Check if IP has the target hostname"""
+        try:
+            hostname = socket.gethostbyaddr(ip)[0].lower()
+            return self.nest_hub_hostname.lower() in hostname
+        except:
+            # Try alternative methods for Chromecast devices
+            return self.check_chromecast_device(ip)
+
+    def check_chromecast_device(self, ip):
+        """Check if device at IP is a Chromecast/Nest Hub using CATT"""
+        try:
+            cmd = f"docker run --rm ryanbarrett/catt-chromecast -d {ip} status"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+            
+            if result.returncode == 0:
+                output = result.stdout.lower()
+                # Look for common Nest Hub / Chromecast indicators
+                nest_indicators = [
+                    "nest hub", "google nest", "living room", "display", 
+                    "chromecast", "cast", "backdrop", "idle", "ready"
+                ]
+                
+                if any(indicator in output for indicator in nest_indicators):
+                    self.logger.info(f"Found Chromecast device at {ip}: {result.stdout.strip()}")
+                    return True
+                
+        except subprocess.TimeoutExpired:
+            self.logger.debug(f"Chromecast check timed out for {ip}")
+        except Exception as e:
+            self.logger.debug(f"Chromecast check failed for {ip}: {e}")
+        
+        return False
+
+    def ensure_docker_running(self):
+        """Ensure Docker is running"""
+        try:
+            result = subprocess.run("docker info", shell=True, capture_output=True)
+            if result.returncode != 0:
+                self.logger.error("Docker is not running")
+                return False
+            return True
+        except Exception as e:
+            self.logger.error(f"Docker check failed: {e}")
+            return False
+
+    def start_web_server(self):
+        """Start the HTTP server if not already running"""
+        try:
+            # Check if container is already running
+            cmd = f"docker ps --filter name={self.server_container_name} --format '{{{{.Names}}}}'"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            
+            if self.server_container_name in result.stdout:
+                self.logger.info("Web server already running")
+                return True
+            
+            # Start the server
+            local_ip = self.get_local_ip()
+            if not local_ip:
+                self.logger.error("Cannot determine local IP for web server")
+                return False
+            
+            install_dir = "/opt/smart-display"
+            src_path = f"{install_dir}/src"
+            
+            cmd = (f"docker run -d --name {self.server_container_name} "
+                   f"-p {self.server_port}:80 "
+                   f"-v {src_path}:/usr/local/apache2/htdocs/ "
+                   f"httpd:alpine")
+            
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+            
+            if result.returncode == 0:
+                self.logger.info(f"Web server started on {local_ip}:{self.server_port}")
+                time.sleep(2)  # Give server time to start
+                return True
+            else:
+                self.logger.error(f"Failed to start web server: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            self.logger.error(f"Error starting web server: {e}")
+            return False
+
+    def cast_to_device(self):
+        """Cast the website to the Nest Hub"""
+        if not self.nest_hub_ip:
+            self.logger.error("No Nest Hub IP available for casting")
+            return False
+        
+        local_ip = self.get_local_ip()
+        if not local_ip:
+            self.logger.error("Cannot determine local IP for casting")
+            return False
+        
+        cast_url = f"http://{local_ip}:{self.server_port}/"
+        
+        try:
+            cmd = (f"docker run --rm "
+                   f"-e ARGUMENTS='-d {self.nest_hub_ip} cast_site {cast_url}' "
+                   f"ryanbarrett/catt-chromecast")
+            
+            self.logger.info(f"Casting {cast_url} to {self.nest_hub_ip}...")
+            
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                self.logger.info(f"Cast initiated: {result.stdout.strip()}")
+                self.last_cast_time = datetime.now()
+                return True
+            else:
+                self.logger.error(f"Casting failed: {result.stderr}")
+                return False
+                
+        except subprocess.TimeoutExpired:
+            self.logger.error("Casting command timed out")
+            return False
+        except Exception as e:
+            self.logger.error(f"Casting error: {e}")
+            return False
+
+    def check_cast_status(self):
+        """Check if our content is still being displayed on the Nest Hub
+        
+        TODO: Implement actual Chromecast status monitoring
+        This is a placeholder for your custom monitoring implementation
+        """
+        # Entry point for custom monitoring - implement your own logic here
+        return True  # Placeholder - always returns True for now
+
+    def check_web_server_health(self):
+        """Check if our web server is responding"""
+        local_ip = self.get_local_ip()
+        if not local_ip:
+            return False
+        
+        try:
+            url = f"http://{local_ip}:{self.server_port}/"
+            response = urllib.request.urlopen(url, timeout=5)
+            return response.getcode() == 200
+        except Exception as e:
+            self.logger.debug(f"Web server health check failed: {e}")
+            return False
+
+    def trigger_recast(self):
+        """Trigger a recast to the device
+        
+        TODO: Add your custom recast logic here
+        This could include stopping current content, waiting, then recasting
+        """
+        # Entry point for custom recast logic - implement your own here
+        return self.cast_to_device()
+
+    def cleanup_containers(self):
+        """Clean up any hanging containers"""
+        try:
+            # Remove old containers
+            subprocess.run(f"docker rm -f {self.server_container_name} 2>/dev/null", shell=True)
+            subprocess.run(f"docker container prune -f", shell=True)
+        except:
+            pass
+
+    def run(self):
+        """Main execution loop"""
+        self.logger.info("Starting Cast Manager...")
+        
+        if not self.ensure_docker_running():
+            self.logger.error("Docker is not available, exiting")
+            return 1
+        
+        self.cleanup_containers()
+        
+        last_network_scan = datetime.min
+        
+        while self.running:
+            try:
+                now = datetime.now()
+                
+                # Scan for Nest Hub if we don't have IP or it's time to rescan
+                if (not self.nest_hub_ip or 
+                    now - last_network_scan > timedelta(seconds=self.network_scan_interval)):
+                    
+                    discovered_ip = self.scan_for_nest_hub()
+                    if discovered_ip:
+                        if discovered_ip != self.nest_hub_ip:
+                            self.logger.info(f"Nest Hub IP updated: {discovered_ip}")
+                            self.nest_hub_ip = discovered_ip
+                    else:
+                        self.logger.warning("Nest Hub not found on network")
+                    
+                    last_network_scan = now
+                
+                # Start web server if we have a device and no server running
+                if self.nest_hub_ip and not self.start_web_server():
+                    self.logger.error("Failed to start web server")
+                    time.sleep(30)
+                    continue
+                
+                # Initial cast when we first find the device
+                if (self.nest_hub_ip and not self.last_cast_time):
+                    self.logger.info("Performing initial cast...")
+                    self.cast_to_device()
+                
+                # TODO: Add your custom monitoring logic here
+                # This is where you can add periodic checks for:
+                # - Cast status monitoring
+                # - Automatic recasting
+                # - Health checks
+                # 
+                # Example entry points:
+                # if should_check_status():
+                #     if not self.check_cast_status():
+                #         self.trigger_recast()
+                
+                time.sleep(30)  # Main loop delay
+                
+            except KeyboardInterrupt:
+                break
+            except Exception as e:
+                self.logger.error(f"Unexpected error in main loop: {e}")
+                time.sleep(30)
+        
+        self.logger.info("Cast Manager shutting down...")
+        self.cleanup_containers()
+        return 0
+
+if __name__ == "__main__":
+    manager = CastManager()
+    exit_code = manager.run()
+    sys.exit(exit_code)
