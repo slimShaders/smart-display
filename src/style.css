@@ -1,0 +1,97 @@
+/* Simple Smart Display for Google Nest Hub (7" 1200x800) */
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    --accent-color: #00ff88;
+    --greeting-color: #ffffff;
+}
+
+body {
+    font-family: 'Arial', 'Helvetica', sans-serif;
+    background: #1a1a1a;
+    color: var(--accent-color);
+    height: 100vh;
+    width: 100vw;
+    direction: rtl;
+    overflow: hidden;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.container {
+    width: 100%;
+    height: 100%;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px;
+    text-align: center;
+}
+
+.greeting {
+    font-size: 4rem;
+    font-weight: 600;
+    margin-bottom: 20px;
+    opacity: 0.9;
+    color: var(--greeting-color);
+}
+
+.time-display {
+    font-size: 9rem;
+    font-weight: 900;
+    line-height: 1;
+    margin-bottom: 20px;
+    text-shadow: 0 0 20px rgba(0, 255, 136, 0.3);
+    letter-spacing: 6px;
+    color: var(--accent-color);
+}
+
+.day-period {
+    display: flex;
+    gap: 30px;
+    margin-bottom: 20px;
+    align-items: center;
+    justify-content: center;
+}
+
+.day {
+    font-size: 4rem;
+    font-weight: 600;
+    opacity: 0.9;
+}
+
+.period {
+    font-size: 3rem;
+    font-weight: 500;
+    opacity: 0.8;
+}
+
+.date-display {
+    font-size: 3.5rem;
+    font-weight: 600;
+    margin-bottom: 50px;
+    opacity: 0.9;
+    line-height: 1.2;
+}
+
+.message {
+    font-size: 2.8rem;
+    font-weight: 500;
+    opacity: 0.8;
+    animation: gentle-pulse 3s ease-in-out infinite;
+}
+
+@keyframes gentle-pulse {
+    0%, 100% {
+        opacity: 0.8;
+        transform: scale(1);
+    }
+    50% {
+        opacity: 1;
+        transform: scale(1.02);
+    }
+}
