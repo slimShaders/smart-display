@@ -50,18 +50,18 @@ function updateTimeAndDate() {
     document.getElementById('greeting').textContent = greeting;
 }
 
-function updateMessage() {
-    const randomMessage = messages[Math.floor(Math.random() * messages.length)];
-    document.getElementById('message').textContent = randomMessage;
-}
+// function updateMessage() {
+//     const randomMessage = messages[Math.floor(Math.random() * messages.length)];
+//     document.getElementById('message').textContent = randomMessage;
+// }
 
 function init() {
     updateTimeAndDate();
-    updateMessage();
+    // updateMessage();
     
     setInterval(updateTimeAndDate, 1000);
     
-    setInterval(updateMessage, 10 * 60 * 1000);
+    // setInterval(updateMessage, 10 * 60 * 1000);
 }
 
 document.addEventListener('DOMContentLoaded', init);
