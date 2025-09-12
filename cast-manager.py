@@ -472,7 +472,6 @@ class CastManager:
                 
                 # First, check if everything is working fine - if so, do nothing
                 if self.nest_hub_ip:
-                    # Quick health check: web server + casting status
                     web_server_ok = self.check_web_server_health()
                     cast_status_ok = self.check_cast_status()
                     
@@ -488,16 +487,26 @@ class CastManager:
                 
                 # Try to get IP from cache first, then scan if needed
                 if not self.nest_hub_ip:
-                    # First try to load from cache
                     cached_ip = self.load_cached_ip()
                     if cached_ip:
                         self.logger.info("Trying cached IP...")
-                        if self.verify_cached_ip(cached_ip):
-                            self.logger.info(f"Cached IP {cached_ip} verified successfully")
+                        try:
+                            ping_result = subprocess.run(
+                                f"ping -c 1 -W 2 {cached_ip}", 
+                                shell=True, 
+                                capture_output=True, 
+                                timeout=5
+                            )
+                        except Exception as e:
+                            self.logger.debug(f"Ping test failed: {e}")
+                            ping_result = None
+                        
+                        if ping_result and ping_result.returncode == 0:
+                            self.logger.info(f"Cached IP {cached_ip} responded to ping - using it")
                             self.nest_hub_ip = cached_ip
                             self.last_ip_verification = now
                         else:
-                            self.logger.info("Cached IP verification failed, will scan network")
+                            self.logger.info(f"Cached IP {cached_ip} not responding to ping, will scan network")
                 
                 # Only do expensive operations if we don't have a valid IP or there are issues
                 if not self.nest_hub_ip:
