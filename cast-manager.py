@@ -26,10 +26,12 @@ class CastManager:
         self.last_cast_time = None
         self.network_scan_interval = 60  # 1 minute
         self.running = True
+        self.cache_file = "/opt/smart-display/device_cache.json"
+        self.last_ip_verification = datetime.min
         
         # Setup logging
         logging.basicConfig(
-            level=logging.INFO,
+            level=logging.DEBUG,
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.FileHandler('/var/log/cast-manager.log'),
@@ -46,6 +48,74 @@ class CastManager:
         """Handle shutdown signals gracefully"""
         self.logger.info(f"Received signal {signum}, shutting down...")
         self.running = False
+
+    def load_cached_ip(self):
+        """Load cached device IP from file"""
+        try:
+            if os.path.exists(self.cache_file):
+                with open(self.cache_file, 'r') as f:
+                    cache_data = json.load(f)
+                    cached_ip = cache_data.get('nest_hub_ip')
+                    cached_time = cache_data.get('last_seen')
+                    
+                    if cached_ip and cached_time:
+                        last_seen = datetime.fromisoformat(cached_time)
+                        # Use cached IP if it was seen within the last 24 hours
+                        if datetime.now() - last_seen < timedelta(hours=24):
+                            self.logger.info(f"Loaded cached IP: {cached_ip}")
+                            return cached_ip
+                        else:
+                            self.logger.info("Cached IP too old, will rescan")
+                    else:
+                        self.logger.debug("Invalid cache data")
+            else:
+                self.logger.debug("No cache file found")
+        except Exception as e:
+            self.logger.warning(f"Failed to load cache: {e}")
+        
+        return None
+
+    def save_cached_ip(self, ip):
+        """Save device IP to cache file"""
+        try:
+            cache_data = {
+                'nest_hub_ip': ip,
+                'last_seen': datetime.now().isoformat(),
+                'hostname': self.nest_hub_hostname
+            }
+            
+            # Ensure cache directory exists
+            os.makedirs(os.path.dirname(self.cache_file), exist_ok=True)
+            
+            with open(self.cache_file, 'w') as f:
+                json.dump(cache_data, f, indent=2)
+            
+            self.logger.debug(f"Cached IP {ip} to {self.cache_file}")
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to save cache: {e}")
+
+    def verify_cached_ip(self, ip):
+        """Verify that cached IP is still valid"""
+        try:
+            # Quick ping test
+            result = subprocess.run(
+                f"ping -c 1 -W 2 {ip}", 
+                shell=True, 
+                capture_output=True, 
+                timeout=5
+            )
+            
+            if result.returncode == 0:
+                # Ping successful, now verify it's still a Chromecast
+                return self.check_chromecast_device(ip)
+            else:
+                self.logger.debug(f"Cached IP {ip} not responding to ping")
+                return False
+                
+        except Exception as e:
+            self.logger.debug(f"IP verification failed: {e}")
+            return False
 
     def get_local_ip(self):
         """Get the local IP address of this device"""
@@ -72,7 +142,7 @@ class CastManager:
         return network_base
 
     def scan_for_nest_hub(self):
-        """Scan network for device with hostname 'nest-hub'"""
+        """Scan network for Chromecast/Nest Hub devices with Google MAC addresses"""
         self.logger.info("Scanning network for Nest Hub...")
         
         network_base = self.get_network_range()
@@ -80,27 +150,29 @@ class CastManager:
             self.logger.error("Could not determine network range")
             return None
 
-        # Use nmap to scan for devices (install with: sudo apt install nmap)
         try:
-            cmd = f"nmap -sn {network_base}.1-254"
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
+            cmd = f"nmap -Pn -p 8008,8009 --open {network_base}.1-254"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
             
             if result.returncode != 0:
                 self.logger.warning("nmap not available, trying alternative scan...")
                 return self.scan_for_nest_hub_alternative()
             
-            # Parse nmap output for active IPs
-            active_ips = []
-            for line in result.stdout.split('\n'):
-                if 'Nmap scan report for' in line:
-                    ip = line.split()[-1].strip('()')
-                    active_ips.append(ip)
+            # Parse nmap output for Google devices with Chromecast ports
+            google_devices = self.parse_nmap_for_google_devices(result.stdout)
             
-            # Check each IP for hostname
-            for ip in active_ips:
-                if self.check_hostname(ip):
-                    self.logger.info(f"Found Nest Hub at {ip}")
-                    return ip
+            if google_devices:
+                # Verify each device using CATT
+                for ip in google_devices:
+                    if self.check_chromecast_device(ip):
+                        self.logger.info(f"Found verified Nest Hub/Chromecast at {ip}")
+                        return ip
+                
+                # If CATT check fails, return the first Google device found
+                self.logger.info(f"Found Google device at {google_devices[0]} (CATT verification failed)")
+                return google_devices[0]
+            else:
+                self.logger.warning("No Google devices with Chromecast ports found")
                     
         except subprocess.TimeoutExpired:
             self.logger.warning("Network scan timed out")
@@ -108,6 +180,43 @@ class CastManager:
             self.logger.error(f"Network scan failed: {e}")
         
         return None
+
+    def parse_nmap_for_google_devices(self, nmap_output):
+        """Parse nmap output to find devices with Google MAC addresses and Chromecast ports"""
+        google_devices = []
+        current_ip = None
+        has_chromecast_ports = False
+        is_google_device = False
+        
+        for line in nmap_output.split('\n'):
+            line = line.strip()
+            
+            # New scan report starts
+            if 'Nmap scan report for' in line:
+                # Save previous device if it was valid
+                if current_ip and has_chromecast_ports and is_google_device:
+                    google_devices.append(current_ip)
+                
+                # Reset for new device
+                current_ip = line.split()[-1].strip('()')
+                has_chromecast_ports = False
+                is_google_device = False
+                
+            # Check for Chromecast ports
+            elif current_ip and ('8008/tcp open' in line or '8009/tcp open' in line):
+                has_chromecast_ports = True
+                
+            # Check for Google MAC address
+            elif current_ip and 'MAC Address:' in line and 'Google' in line:
+                is_google_device = True
+                self.logger.debug(f"Found Google device at {current_ip}: {line}")
+        
+        # Don't forget the last device
+        if current_ip and has_chromecast_ports and is_google_device:
+            google_devices.append(current_ip)
+            
+        self.logger.info(f"Found {len(google_devices)} Google device(s) with Chromecast ports: {google_devices}")
+        return google_devices
 
     def scan_for_nest_hub_alternative(self):
         """Alternative scan method using ping"""
@@ -153,7 +262,7 @@ class CastManager:
     def check_chromecast_device(self, ip):
         """Check if device at IP is a Chromecast/Nest Hub using CATT"""
         try:
-            cmd = f"docker run --rm ryanbarrett/catt-chromecast -d {ip} status"
+            cmd = f"catt -d {ip} status"
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
             
             if result.returncode == 0:
@@ -240,9 +349,7 @@ class CastManager:
         cast_url = f"http://{local_ip}:{self.server_port}/"
         
         try:
-            cmd = (f"docker run --rm "
-                   f"-e ARGUMENTS='-d {self.nest_hub_ip} cast_site {cast_url}' "
-                   f"ryanbarrett/catt-chromecast")
+            cmd = f"catt -d {self.nest_hub_ip} cast_site {cast_url}"
             
             self.logger.info(f"Casting {cast_url} to {self.nest_hub_ip}...")
             
@@ -264,13 +371,52 @@ class CastManager:
             return False
 
     def check_cast_status(self):
-        """Check if our content is still being displayed on the Nest Hub
-        
-        TODO: Implement actual Chromecast status monitoring
-        This is a placeholder for your custom monitoring implementation
-        """
-        # Entry point for custom monitoring - implement your own logic here
-        return True  # Placeholder - always returns True for now
+        """Check if our content is still being displayed on the Nest Hub"""
+        if not self.nest_hub_ip:
+            return False
+            
+        try:
+            # Get detailed device info using CATT
+            cmd = f"catt -d {self.nest_hub_ip} info"
+            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=10)
+            
+            if result.returncode != 0:
+                self.logger.warning(f"Failed to get device info: {result.stderr}")
+                return False
+            
+            info_output = result.stdout.strip()
+            self.logger.debug(f"Device info: {info_output}")
+            
+            # Check if DashCast (web browser) app is active
+            if "display_name: DashCast" in info_output:
+                # DashCast is running - this means web content is being displayed
+                
+                # Check if it's our content by looking for our server IP in a content check
+                local_ip = self.get_local_ip()
+                if local_ip:
+                    # If DashCast is active and we have our IP, assume it's our content
+                    # (In practice, you might want to add more sophisticated checking)
+                    self.logger.debug("DashCast app is active - assuming our content is displayed")
+                    return True
+                
+            # Check for other indicators that might suggest our content is active
+            if any(indicator in info_output.lower() for indicator in [
+                "status_text: Application ready",
+                "app_id: 84912283"  # DashCast app ID
+            ]):
+                # DashCast app is loaded, likely showing web content
+                return True
+            
+            # If we reach here, likely no web content or different app
+            self.logger.debug("No DashCast app detected or device idle")
+            return False
+            
+        except subprocess.TimeoutExpired:
+            self.logger.warning("Device info check timed out")
+            return False
+        except Exception as e:
+            self.logger.debug(f"Cast status check failed: {e}")
+            return False
 
     def check_web_server_health(self):
         """Check if our web server is responding"""
@@ -320,30 +466,91 @@ class CastManager:
             try:
                 now = datetime.now()
                 
-                # Scan for Nest Hub if we don't have IP or it's time to rescan
-                if (not self.nest_hub_ip or 
-                    now - last_network_scan > timedelta(seconds=self.network_scan_interval)):
+                # Initialize status variables
+                web_server_ok = True
+                cast_status_ok = True
+                
+                # First, check if everything is working fine - if so, do nothing
+                if self.nest_hub_ip:
+                    # Quick health check: web server + casting status
+                    web_server_ok = self.check_web_server_health()
+                    cast_status_ok = self.check_cast_status()
                     
+                    if web_server_ok and cast_status_ok:
+                        self.logger.debug("All systems healthy - no action needed")
+                        time.sleep(30)  # Everything working, just wait
+                        continue
+                    else:
+                        if not web_server_ok:
+                            self.logger.info("Web server issue detected")
+                        if not cast_status_ok:
+                            self.logger.info("Cast status issue detected")
+                
+                # Try to get IP from cache first, then scan if needed
+                if not self.nest_hub_ip:
+                    # First try to load from cache
+                    cached_ip = self.load_cached_ip()
+                    if cached_ip:
+                        self.logger.info("Trying cached IP...")
+                        if self.verify_cached_ip(cached_ip):
+                            self.logger.info(f"Cached IP {cached_ip} verified successfully")
+                            self.nest_hub_ip = cached_ip
+                            self.last_ip_verification = now
+                        else:
+                            self.logger.info("Cached IP verification failed, will scan network")
+                
+                # Only do expensive operations if we don't have a valid IP or there are issues
+                if not self.nest_hub_ip:
+                    self.logger.info("No device IP - scanning network...")
                     discovered_ip = self.scan_for_nest_hub()
                     if discovered_ip:
-                        if discovered_ip != self.nest_hub_ip:
-                            self.logger.info(f"Nest Hub IP updated: {discovered_ip}")
-                            self.nest_hub_ip = discovered_ip
+                        self.logger.info(f"Nest Hub IP found: {discovered_ip}")
+                        self.nest_hub_ip = discovered_ip
+                        self.save_cached_ip(discovered_ip)  # Cache the new IP
+                        self.last_ip_verification = now
                     else:
                         self.logger.warning("Nest Hub not found on network")
+                        time.sleep(30)  # Wait before trying again
+                        continue
                     
                     last_network_scan = now
                 
-                # Start web server if we have a device and no server running
-                if self.nest_hub_ip and not self.start_web_server():
-                    self.logger.error("Failed to start web server")
-                    time.sleep(30)
-                    continue
+                # Periodic IP verification (only if we haven't checked recently and there are issues)
+                elif now - self.last_ip_verification > timedelta(minutes=10):
+                    self.logger.debug("Periodic IP verification...")
+                    if not self.verify_cached_ip(self.nest_hub_ip):
+                        self.logger.info("IP verification failed - device may have changed")
+                        self.nest_hub_ip = None
+                        continue  # Will trigger scan on next iteration
+                    else:
+                        self.last_ip_verification = now
                 
-                # Initial cast when we first find the device
-                if (self.nest_hub_ip and not self.last_cast_time):
-                    self.logger.info("Performing initial cast...")
-                    self.cast_to_device()
+                # Handle issues: restart web server and/or recast
+                if self.nest_hub_ip:
+                    # Check if web server needs to be started/restarted
+                    if not self.start_web_server():
+                        self.logger.error("Failed to start web server")
+                        time.sleep(30)
+                        continue
+                    
+                    # Check if we need to recast (either initial cast or detected issue)
+                    need_to_cast = (
+                        not self.last_cast_time or  # Initial cast
+                        not cast_status_ok  # Cast status issue detected
+                    )
+                    
+                    if need_to_cast:
+                        if not self.last_cast_time:
+                            self.logger.info("Performing initial cast...")
+                        else:
+                            self.logger.info("Recasting due to status issue...")
+                        
+                        success = self.cast_to_device()
+                        if not success:
+                            self.logger.error("Failed to cast, will retry next cycle")
+                        else:
+                            # Reset the status check variables since we just cast
+                            cast_status_ok = True
                 
                 # TODO: Add your custom monitoring logic here
                 # This is where you can add periodic checks for:

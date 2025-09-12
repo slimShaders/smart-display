@@ -29,11 +29,15 @@ sudo apt update && sudo apt upgrade -y
 echo -e "${YELLOW}Installing required packages...${NC}"
 sudo apt install -y \
     python3 \
-    python3-pip \
+    pipx \
     curl \
     nmap \
     avahi-utils \
     net-tools
+
+# Install CATT Python package
+echo -e "${YELLOW}Installing CATT (Cast All The Things)...${NC}"
+pipx install catt
 
 # Install Docker if not present
 if ! command -v docker &> /dev/null; then
@@ -72,9 +76,7 @@ if [ -f "index.html" ] && [ ! -f "src/index.html" ]; then
 fi
 
 # Make scripts executable
-chmod +x start.sh
 chmod +x cast-manager.py
-chmod +x install.sh
 
 # Create systemd service for auto-start
 echo -e "${YELLOW}Creating systemd service...${NC}"
@@ -88,7 +90,7 @@ Requires=docker.service
 Type=simple
 User=$USER
 WorkingDirectory=${INSTALL_DIR}
-ExecStart=${INSTALL_DIR}/start.sh
+ExecStart=${INSTALL_DIR}/cast-manager.py
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -105,7 +107,15 @@ sudo systemctl enable cast-manager.service
 # Pre-pull Docker images
 echo -e "${YELLOW}Pre-pulling Docker images...${NC}"
 docker pull httpd:alpine
-docker pull ryanbarrett/catt-chromecast
+
+# Verify CATT installation
+echo -e "${YELLOW}Verifying CATT installation...${NC}"
+if catt --help &> /dev/null; then
+    echo -e "${GREEN}CATT installed successfully${NC}"
+else
+    echo -e "${RED}CATT installation failed${NC}"
+    exit 1
+fi
 
 echo
 echo -e "${GREEN}================================${NC}"
