@@ -21,6 +21,7 @@ class CastManager:
     def __init__(self):
         self.nest_hub_ip = None
         self.nest_hub_hostname = "nest-hub"
+        self.nest_hub_mac = "7C:D9:5C:62:13:F6"
         self.server_port = 5500
         self.server_container_name = "smart-display-server"
         self.last_cast_time = None
@@ -131,48 +132,54 @@ class CastManager:
             return None
 
     def get_network_range(self):
-        """Get the network range for scanning"""
-        local_ip = self.get_local_ip()
-        if not local_ip:
-            return None
-        
-        # Assume /24 network
-        ip_parts = local_ip.split('.')
-        network_base = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}"
-        return network_base
+        """Get the actual network range for scanning based on subnet"""
+        try:
+            result = subprocess.run("ip route | grep $(ip route | awk '/default/ {print $5}') | grep 'scope link'", 
+                                   shell=True, capture_output=True, text=True, timeout=5)
+            
+            if result.returncode == 0 and result.stdout.strip():
+                for line in result.stdout.strip().split('\n'):
+                    if '/' in line and 'scope link' in line:
+                        network_cidr = line.split()[0]
+                        self.logger.info(f"Detected network subnet: {network_cidr}")
+                        return network_cidr
+            
+            local_ip = self.get_local_ip()
+            if local_ip:
+                ip_parts = local_ip.split('.')
+                fallback_network = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.0/24"
+                self.logger.info(f"Using fallback network range: {fallback_network}")
+                return fallback_network
+                
+        except Exception as e:
+            self.logger.debug(f"Failed to detect network range: {e}")
+            
+        return None
 
     def scan_for_nest_hub(self):
-        """Scan network for Chromecast/Nest Hub devices with Google MAC addresses"""
+        """Scan network for Chromecast/Nest Hub devices with specific MAC address"""
         self.logger.info("Scanning network for Nest Hub...")
         
-        network_base = self.get_network_range()
-        if not network_base:
+        network_range = self.get_network_range()
+        if not network_range:
             self.logger.error("Could not determine network range")
             return None
 
         try:
-            cmd = f"nmap -Pn -p 8008,8009 --open {network_base}.1-254"
+            cmd = f"nmap -Pn -p 8008,8009 --open {network_range}"
+            self.logger.info(f"Scanning subnet: {network_range}")
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
             
             if result.returncode != 0:
                 self.logger.warning("nmap not available, trying alternative scan...")
                 return self.scan_for_nest_hub_alternative()
             
-            # Parse nmap output for Google devices with Chromecast ports
-            google_devices = self.parse_nmap_for_google_devices(result.stdout)
+            target_ip = self.parse_nmap_for_target_device(result.stdout)
             
-            if google_devices:
-                # Verify each device using CATT
-                for ip in google_devices:
-                    if self.check_chromecast_device(ip):
-                        self.logger.info(f"Found verified Nest Hub/Chromecast at {ip}")
-                        return ip
-                
-                # If CATT check fails, return the first Google device found
-                self.logger.info(f"Found Google device at {google_devices[0]} (CATT verification failed)")
-                return google_devices[0]
+            if target_ip:
+                return target_ip
             else:
-                self.logger.warning("No Google devices with Chromecast ports found")
+                self.logger.warning(f"Target device with MAC {self.nest_hub_mac} not found")
                     
         except subprocess.TimeoutExpired:
             self.logger.warning("Network scan timed out")
@@ -181,42 +188,44 @@ class CastManager:
         
         return None
 
-    def parse_nmap_for_google_devices(self, nmap_output):
-        """Parse nmap output to find devices with Google MAC addresses and Chromecast ports"""
-        google_devices = []
+    def parse_nmap_for_target_device(self, nmap_output):
+        """Parse nmap output to find device with our specific MAC address and Chromecast ports"""
+        target_ip = None
         current_ip = None
         has_chromecast_ports = False
-        is_google_device = False
+        is_target_device = False
         
         for line in nmap_output.split('\n'):
             line = line.strip()
             
             # New scan report starts
             if 'Nmap scan report for' in line:
-                # Save previous device if it was valid
-                if current_ip and has_chromecast_ports and is_google_device:
-                    google_devices.append(current_ip)
+                if current_ip and has_chromecast_ports and is_target_device:
+                    target_ip = current_ip
                 
                 # Reset for new device
                 current_ip = line.split()[-1].strip('()')
                 has_chromecast_ports = False
-                is_google_device = False
+                is_target_device = False
                 
             # Check for Chromecast ports
             elif current_ip and ('8008/tcp open' in line or '8009/tcp open' in line):
                 has_chromecast_ports = True
                 
-            # Check for Google MAC address
-            elif current_ip and 'MAC Address:' in line and 'Google' in line:
-                is_google_device = True
-                self.logger.debug(f"Found Google device at {current_ip}: {line}")
+            elif current_ip and 'MAC Address:' in line and self.nest_hub_mac.upper() in line.upper():
+                is_target_device = True
+                self.logger.info(f"Found target device at {current_ip}: {line}")
         
         # Don't forget the last device
-        if current_ip and has_chromecast_ports and is_google_device:
-            google_devices.append(current_ip)
+        if current_ip and has_chromecast_ports and is_target_device:
+            target_ip = current_ip
             
-        self.logger.info(f"Found {len(google_devices)} Google device(s) with Chromecast ports: {google_devices}")
-        return google_devices
+        if target_ip:
+            self.logger.info(f"Found target Nest Hub at {target_ip} with MAC {self.nest_hub_mac}")
+        else:
+            self.logger.warning(f"Target device with MAC {self.nest_hub_mac} not found")
+            
+        return target_ip
 
     def scan_for_nest_hub_alternative(self):
         """Alternative scan method using ping"""
@@ -242,47 +251,9 @@ class CastManager:
             except:
                 continue
         
-        # Check hostnames
-        for ip in active_ips:
-            if self.check_hostname(ip):
-                self.logger.info(f"Found Nest Hub at {ip}")
-                return ip
-        
+        self.logger.warning("Ping-based scan cannot verify MAC addresses")
         return None
 
-    def check_hostname(self, ip):
-        """Check if IP has the target hostname"""
-        try:
-            hostname = socket.gethostbyaddr(ip)[0].lower()
-            return self.nest_hub_hostname.lower() in hostname
-        except:
-            # Try alternative methods for Chromecast devices
-            return self.check_chromecast_device(ip)
-
-    def check_chromecast_device(self, ip):
-        """Check if device at IP is a Chromecast/Nest Hub using CATT"""
-        try:
-            cmd = f"catt -d {ip} status"
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
-            
-            if result.returncode == 0:
-                output = result.stdout.lower()
-                # Look for common Nest Hub / Chromecast indicators
-                nest_indicators = [
-                    "nest hub", "google nest", "living room", "display", 
-                    "chromecast", "cast", "backdrop", "idle", "ready"
-                ]
-                
-                if any(indicator in output for indicator in nest_indicators):
-                    self.logger.info(f"Found Chromecast device at {ip}: {result.stdout.strip()}")
-                    return True
-                
-        except subprocess.TimeoutExpired:
-            self.logger.debug(f"Chromecast check timed out for {ip}")
-        except Exception as e:
-            self.logger.debug(f"Chromecast check failed for {ip}: {e}")
-        
-        return False
 
     def ensure_docker_running(self):
         """Ensure Docker is running"""
